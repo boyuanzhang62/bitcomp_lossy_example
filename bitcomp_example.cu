@@ -45,10 +45,11 @@
 #include <cuda_runtime.h>
 
 #include <native/bitcomp.h>
+#include <chrono>
 
 #include "utils.h"
 
-#define DATA_TYPE double
+#define DATA_TYPE float
 
 #define CUDA_CHECK(func)                                                        \
     do                                                                          \
@@ -78,7 +79,7 @@
         }                                                      \
     }
 
-__global__ void log2Transform(double *input, int n)
+__global__ void log2Transform(float *input, int n)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n)
@@ -87,7 +88,7 @@ __global__ void log2Transform(double *input, int n)
     }
 }
 
-__global__ void exp2Transform(double *input, int n)
+__global__ void exp2Transform(float *input, int n)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n)
@@ -97,14 +98,15 @@ __global__ void exp2Transform(double *input, int n)
 }
 
 template <typename T>
-T *compress(char *filePath, double pwrErrorBound)
+T *compress(char *filePath, float pwrErrorBound)
 {
+    auto cpustart = std::chrono::high_resolution_clock::now();
     size_t fileSize = io::FileSize(filePath);
     size_t dataTypeSize = fileSize / sizeof(T);
     T *inputHost = (T *)malloc(fileSize);
     io::read_binary_to_array<T>(filePath, inputHost, fileSize / sizeof(T));
 
-    double absErrorBound = log2(1.0 + pwrErrorBound);
+    float absErrorBound = pwrErrorBound;
 
     T *inputDevice;
     CUDA_CHECK(cudaMalloc(&inputDevice, fileSize));
@@ -125,7 +127,7 @@ T *compress(char *filePath, double pwrErrorBound)
     BITCOMP_CHECK(bitcompCreatePlan(
         &plan,                        // Bitcomp handle
         fileSize,                     // Size in bytes of the uncompressed data
-        BITCOMP_FP64_DATA,        // Data type
+        BITCOMP_FP32_DATA,        // Data type
         BITCOMP_LOSSY_FP_TO_UNSIGNED, // Compression type
         BITCOMP_DEFAULT_ALGO));       // Bitcomp algo, default or sparse
 
@@ -142,10 +144,10 @@ T *compress(char *filePath, double pwrErrorBound)
     // Start recording on the specified stream
     cudaEventRecord(start, stream);
 
-    log2Transform<<<(dataTypeSize + 255) / 256, 256, 0, stream>>>(inputDevice, dataTypeSize);
+    // log2Transform<<<(dataTypeSize + 255) / 256, 256, 0, stream>>>(inputDevice, dataTypeSize);
 
     // Compress the input data with the chosen quantization delta
-    BITCOMP_CHECK(bitcompCompressLossy_fp64(plan, inputDevice, compbuf, absErrorBound));
+    BITCOMP_CHECK(bitcompCompressLossy_fp32(plan, inputDevice, compbuf, absErrorBound));
 
     // Stop recording on the specified stream
     cudaEventRecord(stop, stream);
@@ -175,6 +177,11 @@ T *compress(char *filePath, double pwrErrorBound)
     std::string str(filePath);
     io::write_array_to_binary<char>(str + ".bitcomp", compressedDataHost, compsize);
 
+    auto cpuend = std::chrono::high_resolution_clock::now();
+
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(cpuend - cpustart);
+    std::cout << "Compression e2e time: " << duration.count() << " microseconds" << std::endl;
+
     // Destroy the events
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
@@ -192,6 +199,7 @@ T *compress(char *filePath, double pwrErrorBound)
 template <typename T>
 T *decompress(char *filePath, size_t originalSize)
 {
+    auto cpustart = std::chrono::high_resolution_clock::now();
     size_t fileSize = io::FileSize(filePath);
     size_t originalDataTypeSize = originalSize / sizeof(T);
     T *inputHost = (T *)malloc(fileSize);
@@ -220,7 +228,7 @@ T *decompress(char *filePath, size_t originalSize)
     BITCOMP_CHECK(bitcompCreatePlan(
         &plan,                  // Bitcomp handle
         originalSize,           // Size in bytes of the uncompressed data
-        BITCOMP_FP64_DATA,  // Data type
+        BITCOMP_FP32_DATA,  // Data type
         BITCOMP_LOSSY_FP_TO_UNSIGNED,       // Compression type
         BITCOMP_DEFAULT_ALGO)); // Bitcomp algo, default or sparse
 
@@ -234,7 +242,7 @@ T *decompress(char *filePath, size_t originalSize)
     // Decompress the data
     BITCOMP_CHECK(bitcompUncompress(plan, inputDevice, outputDevice));
 
-    exp2Transform<<<(originalDataTypeSize + 255) / 256, 256, 0, stream>>>(outputDevice, originalDataTypeSize);
+    // exp2Transform<<<(originalDataTypeSize + 255) / 256, 256, 0, stream>>>(outputDevice, originalDataTypeSize);
 
     // Stop recording on the specified stream
     cudaEventRecord(stop, stream);
@@ -255,6 +263,11 @@ T *decompress(char *filePath, size_t originalSize)
     std::string str(filePath);
     io::write_array_to_binary<T>(str + ".decompressed", outputHost, originalSize / sizeof(T));
 
+    auto cpuend = std::chrono::high_resolution_clock::now();
+
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(cpuend - cpustart);
+    std::cout << "Decompression e2e time: " << duration.count() << " microseconds" << std::endl;
+    
     // Clean up
     BITCOMP_CHECK(bitcompDestroyPlan(plan));
     CUDA_CHECK(cudaFree(inputDevice));
@@ -266,7 +279,7 @@ T *decompress(char *filePath, size_t originalSize)
 }
 
 template <typename T>
-void roundTripVerification(char *filePath, double pwrErrorBound)
+void roundTripVerification(char *filePath, float pwrErrorBound)
 {
     size_t fileSize = io::FileSize(filePath);
     T *originalData = compress<T>(filePath, pwrErrorBound);
@@ -277,7 +290,7 @@ void roundTripVerification(char *filePath, double pwrErrorBound)
 
     for (int i = 0; i < fileSize / sizeof(T); i++)
     {
-        if (i == 0 || fabs(originalData[i] - reconstructedData[i]) > pwrErrorBound * originalData[i])
+        if (fabs(originalData[i] - reconstructedData[i]) > pwrErrorBound)
         {
             std::cout << "Error: originalData[" << i << "] = " << originalData[i] << " != reconstructedData[" << i << "] = " << reconstructedData[i] << std::endl;
             return;
